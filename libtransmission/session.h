@@ -222,6 +222,14 @@ struct tr_session
 
     struct tr_bindinfo* public_ipv4;
     struct tr_bindinfo* public_ipv6;
+
+    char* lightning_rpc_name;
+
+    bool lightning_connected;
+    int lightning_fd;
+    int lightning_next_id;
+    int requesting_price_per_piece_msat;
+    int willing_to_pay_price_per_piece_msat;
 };
 
 static inline tr_port tr_sessionGetPublicPeerPort(tr_session const* session)
@@ -320,3 +328,8 @@ bool tr_sessionGetActiveSpeedLimit_Bps(tr_session const* session, tr_direction d
 void tr_sessionGetNextQueuedTorrents(tr_session* session, tr_direction dir, size_t numwanted, tr_ptrArray* setme);
 
 int tr_sessionCountQueueFreeSlots(tr_session* session, tr_direction);
+void tr_sessionSetLightningRPCName(tr_session* session, char const* lightning_rpc_name);
+bool tr_sessionLightningConfigured(tr_session const* session);
+char* tr_sessionGetLightningRPCName(tr_session const* session);
+bool tr_sessionSendLnMessage(tr_session* session, char* msg, tr_variant** result);
+int tr_sessionGetLnNextMsgId(tr_session* session);

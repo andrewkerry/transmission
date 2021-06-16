@@ -310,7 +310,7 @@ static void removeKeRangerRansomware()
         [[NSDocumentController sharedDocumentController] clearRecentDocuments: nil];
 
         tr_variant settings;
-        tr_variantInitDict(&settings, 41);
+        tr_variantInitDict(&settings, 42);
         tr_sessionGetDefaultSettings(&settings);
 
         const BOOL usesSpeedLimitSched = [fDefaults boolForKey: @"SpeedLimitAuto"];
@@ -384,6 +384,14 @@ static void removeKeRangerRansomware()
         tr_variantDictAddBool(&settings, TR_KEY_script_torrent_done_enabled, [fDefaults boolForKey: @"DoneScriptEnabled"]);
         tr_variantDictAddStr(&settings, TR_KEY_script_torrent_done_filename, [[fDefaults stringForKey: @"DoneScriptPath"] UTF8String]);
         tr_variantDictAddBool(&settings, TR_KEY_utp_enabled, [fDefaults boolForKey: @"UTPGlobal"]);
+
+        // TODO: Add to GUI
+        if ([fDefaults objectForKey: @"LightningRPCName"])
+            tr_variantDictAddStr(&settings, TR_KEY_lightning_rpc_name, [[fDefaults stringForKey: @"LightningRPCName"] UTF8String]);
+        if ([fDefaults objectForKey: @"LightningRequestingPricePerPieceMsat"])
+            tr_variantDictAddInt(&settings, TR_KEY_requesting_price_per_piece_msat, [fDefaults integerForKey: @"LightningRequestingPricePerPieceMsat"]);
+        if ([fDefaults objectForKey: @"LightningWillingToPayPricePerPieceMsat"])
+            tr_variantDictAddInt(&settings, TR_KEY_willing_to_pay_price_per_piece_msat, [fDefaults integerForKey: @"LightningWillingToPayPricePerPieceMsat"]);
 
         // TODO: Add to GUI
         if ([fDefaults objectForKey: @"RPCHostWhitelist"])

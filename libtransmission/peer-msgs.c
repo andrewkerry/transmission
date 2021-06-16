@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
@@ -65,6 +66,8 @@ enum
     /* */
     UT_PEX_ID = 1,
     UT_METADATA_ID = 3,
+    TR_PAYMENTS_ID = 5,
+
     /* */
     MAX_PEX_PEER_COUNT = 50,
     /* */
@@ -94,7 +97,9 @@ enum
     /* defined in BEP #9 */
     METADATA_MSG_TYPE_REQUEST = 0,
     METADATA_MSG_TYPE_DATA = 1,
-    METADATA_MSG_TYPE_REJECT = 2
+    METADATA_MSG_TYPE_REJECT = 2,
+
+    MAX_NUM_PENDING_INVOICES = 8,
 };
 
 enum
@@ -176,6 +181,7 @@ struct tr_peerMsgs
     bool client_is_interested;
 
     bool peerSupportsPex;
+    bool peerSupportsPayments;
     bool peerSupportsMetadataXfer;
     bool clientSentLtepHandshake;
     bool peerSentLtepHandshake;
@@ -195,6 +201,7 @@ struct tr_peerMsgs
 
     uint8_t state;
     uint8_t ut_pex_id;
+    uint8_t tr_payments_id;
     uint8_t ut_metadata_id;
     uint16_t pexCount;
     uint16_t pexCount6;
@@ -242,6 +249,17 @@ struct tr_peerMsgs
     struct event* pexTimer;
 
     struct tr_peerIo* io;
+
+    // keep track of how many bytes a peer has paid us for
+    // that we haven't sent them yet
+    // unit: bytes
+    int64_t received_payment_balance;
+    char* pending_invoices[MAX_NUM_PENDING_INVOICES];
+
+    // keep track of how many bytes we've paid a peer
+    // that they haven't sent us yet
+    // unit: bytes
+    int64_t paid_payment_balance;
 };
 
 /**
@@ -312,6 +330,199 @@ static void pokeBatchPeriod(tr_peerMsgs* msgs, int interval)
 static void dbgOutMessageLen(tr_peerMsgs* msgs)
 {
     dbgmsg(msgs, "outMessage size is now %zu", evbuffer_get_length(msgs->outMessages));
+}
+
+static void lnGenerateInvoice(tr_peerMsgs* msgs, int piece, int start, int length, char** invoice, char** payment_hash)
+{
+    char msg[4096];
+    dbgmsg(msgs, "enter lnGenerateInvoice");
+    memset(msg, 0, sizeof(msg));
+    char label[16];
+    for (int i = 0; i < 15; i++)
+    {
+        label[i] = tr_rand_int_weak(16) + 'a';
+    }
+
+    label[15] = 0;
+
+    int requesting_price_per_piece_msat = getSession(msgs)->requesting_price_per_piece_msat;
+    if (!requesting_price_per_piece_msat)
+    {
+        return;
+    }
+
+    snprintf(msg, 4096,
+        "{ \"jsonrpc\": \"2.0\", \"method\": \"invoice\", \"id\": %d, \"params\": { \"msatoshi\": %d, \"label\": \"%s\", \"description\": \"%d %d %d\", \"expiry\": 900 } }", tr_sessionGetLnNextMsgId(
+        msgs->torrent->session), requesting_price_per_piece_msat, label, piece, start, length);
+    tr_variant* top;
+    bool succ = tr_sessionSendLnMessage(msgs->torrent->session, msg, &top);
+    if (succ)
+    {
+        tr_variant* resdict;
+        tr_variantDictFindDict(top, TR_KEY_result, &resdict);
+        char const* bolt11;
+        if (tr_variantDictFindStr(resdict, TR_KEY_bolt11, &bolt11, NULL))
+        {
+            dbgmsg(msgs, "Got bolt11 invoice from lightning-rpc: %s", bolt11);
+            *invoice = tr_strdup(bolt11);
+            char const* paym;
+            if (tr_variantDictFindStr(resdict, TR_KEY_payment_hash, &paym, NULL))
+            {
+                dbgmsg(msgs, "Got payment hash from lightning-rpc: %s", paym);
+                if (strlen(paym) == 64)
+                {
+                    *payment_hash = tr_strdup(paym);
+                }
+            }
+        }
+        else
+        {
+            dbgmsg(msgs, "No bolt11 in lightning-rpc reply");
+        }
+
+        tr_variantFree(top);
+    }
+}
+
+static bool lnCheckInvoicePaid(tr_peerMsgs* msgs, char* payment_hash)
+{
+    char msg[4096];
+    memset(msg, 0, sizeof(msg));
+    bool found = false;
+
+    snprintf(msg, 4096,
+        "{ \"jsonrpc\": \"2.0\", \"method\": \"listinvoices\", \"id\": %d, \"params\": { \"payment_hash\": \"%s\" } }", tr_sessionGetLnNextMsgId(
+        msgs->torrent->session), payment_hash);
+    tr_variant* top;
+    bool succ = tr_sessionSendLnMessage(msgs->torrent->session, msg, &top);
+    if (succ)
+    {
+        tr_variant* resdict;
+        tr_variantDictFindDict(top, TR_KEY_result, &resdict);
+        tr_variant* invlist;
+        if (tr_variantDictFindList(resdict, TR_KEY_invoices, &invlist))
+        {
+            size_t len = tr_variantListSize(invlist);
+            if (len != 1)
+            {
+                dbgmsg(msgs, "Invalid invoice list length");
+            }
+            else
+            {
+                tr_variant* invoice = tr_variantListChild(invlist, 0);
+                char const* status;
+                if (tr_variantDictFindStr(invoice, TR_KEY_status, &status, NULL))
+                {
+                    if (!strcmp(status, "paid"))
+                    {
+                        int64_t received = 0;
+                        if (tr_variantDictFindInt(invoice, TR_KEY_msatoshi_received, &received) && received > 0)
+                        {
+                            // one invoice -> one piece
+                            msgs->received_payment_balance += tr_torPieceCountBytes(msgs->torrent, 0);
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            dbgmsg(msgs, "No bolt11 in lightning-rpc reply");
+        }
+
+        tr_variantFree(top);
+    }
+
+    return found;
+}
+
+static void updatePeerPaymentBalance(tr_peerMsgs* msgs)
+{
+    int i;
+    for (i = 0; i < MAX_NUM_PENDING_INVOICES; i++)
+    {
+        if (msgs->pending_invoices[i])
+        {
+            bool found = lnCheckInvoicePaid(msgs, msgs->pending_invoices[i]);
+            if (found)
+            {
+                tr_free(msgs->pending_invoices[i]);
+                msgs->pending_invoices[i] = NULL;
+            }
+        }
+    }
+}
+
+static void notePendingInvoice(tr_peerMsgs* msgs, char* payment_hash)
+{
+    int i;
+    dbgmsg(msgs, "enter notePendingInvoice");
+    // always keep one at NULL
+    for (i = 0; i < MAX_NUM_PENDING_INVOICES; i++)
+    {
+        if (!msgs->pending_invoices[i])
+        {
+            msgs->pending_invoices[i] = payment_hash;
+            if (i == MAX_NUM_PENDING_INVOICES - 1)
+            {
+                tr_free(msgs->pending_invoices[0]);
+                msgs->pending_invoices[0] = NULL;
+            }
+            else if (msgs->pending_invoices[i + 1])
+            {
+                tr_free(msgs->pending_invoices[i + 1]);
+                msgs->pending_invoices[i + 1] = NULL;
+            }
+
+            break;
+        }
+    }
+
+    if (i == MAX_NUM_PENDING_INVOICES)
+    {
+        tr_free(msgs->pending_invoices[0]);
+        msgs->pending_invoices[0] = payment_hash;
+        tr_free(msgs->pending_invoices[1]);
+        msgs->pending_invoices[1] = NULL;
+    }
+}
+
+static void protocolSendRequestPayment(tr_peerMsgs* msgs, struct peer_request const* req)
+{
+    if (!msgs->peerSupportsPayments)
+    {
+        dbgmsg(msgs, "Peer doesn't support payment");
+        return;
+    }
+
+    struct evbuffer* out = msgs->outMessages;
+
+    char* invoice = NULL;
+    char* payment_hash = NULL;
+    lnGenerateInvoice(msgs, req->index, req->offset, req->length, &invoice, &payment_hash);
+    if (invoice && payment_hash)
+    {
+        dbgmsg(msgs, "Requesting payment");
+        notePendingInvoice(msgs, payment_hash);
+        tr_variant dict;
+        tr_variantInitDict(&dict, 1);
+        tr_variantDictAddStr(&dict, TR_KEY_bolt11, invoice);
+        struct evbuffer* payload;
+        payload = tr_variantToBuf(&dict, TR_VARIANT_FMT_BENC);
+        evbuffer_add_uint32(out, 2 * sizeof(uint8_t) + evbuffer_get_length(payload));
+        evbuffer_add_uint8(out, BT_LTEP);
+        evbuffer_add_uint8(out, msgs->tr_payments_id);
+        evbuffer_add_buffer(out, payload);
+        pokeBatchPeriod(msgs, IMMEDIATE_PRIORITY_INTERVAL_SECS);
+        tr_free(invoice);
+    }
+    else
+    {
+        dbgmsg(msgs, "Could not create invoice");
+    }
+
+    dbgOutMessageLen(msgs);
 }
 
 static void protocolSendReject(tr_peerMsgs* msgs, struct peer_request const* req)
@@ -925,19 +1136,21 @@ static void sendLtepHandshake(tr_peerMsgs* msgs)
     tr_variantDictAddBool(&val, TR_KEY_upload_only, tr_torrentIsSeed(msgs->torrent));
     tr_variantDictAddQuark(&val, TR_KEY_v, version_quark);
 
-    if (allow_metadata_xfer || allow_pex)
+    tr_variant* m = tr_variantDictAddDict(&val, TR_KEY_m, 2);
+
+    if (allow_metadata_xfer)
     {
-        tr_variant* m = tr_variantDictAddDict(&val, TR_KEY_m, 2);
+        tr_variantDictAddInt(m, TR_KEY_ut_metadata, UT_METADATA_ID);
+    }
 
-        if (allow_metadata_xfer)
-        {
-            tr_variantDictAddInt(m, TR_KEY_ut_metadata, UT_METADATA_ID);
-        }
+    if (allow_pex)
+    {
+        tr_variantDictAddInt(m, TR_KEY_ut_pex, UT_PEX_ID);
+    }
 
-        if (allow_pex)
-        {
-            tr_variantDictAddInt(m, TR_KEY_ut_pex, UT_PEX_ID);
-        }
+    if (tr_sessionLightningConfigured(msgs->torrent->session))
+    {
+        tr_variantDictAddInt(m, TR_KEY_tr_payments, TR_PAYMENTS_ID);
     }
 
     payload = tr_variantToBuf(&val, TR_VARIANT_FMT_BENC);
@@ -1011,6 +1224,16 @@ static void parseLtepHandshake(tr_peerMsgs* msgs, uint32_t len, struct evbuffer*
             dbgmsg(msgs, "msgs->ut_pex is %d", (int)msgs->ut_pex_id);
         }
 
+        if (tr_sessionLightningConfigured(msgs->torrent->session))
+        {
+            if (tr_variantDictFindInt(sub, TR_KEY_tr_payments, &i))
+            {
+                msgs->peerSupportsPayments = i != 0;
+                msgs->tr_payments_id = (uint8_t)i;
+                dbgmsg(msgs, "msgs->tr_payments is %d", (int)msgs->tr_payments_id);
+            }
+        }
+
         if (tr_variantDictFindInt(sub, TR_KEY_ut_metadata, &i))
         {
             msgs->peerSupportsMetadataXfer = i != 0;
@@ -1071,6 +1294,151 @@ static void parseLtepHandshake(tr_peerMsgs* msgs, uint32_t len, struct evbuffer*
 
     tr_variantFree(&val);
     tr_free(tmp);
+}
+
+static bool lnPayInvoice(tr_peerMsgs* msgs, char const* bolt11)
+{
+    char outbuf[1024];
+    memset(outbuf, 0, sizeof(outbuf));
+    tr_snprintf(outbuf, sizeof(outbuf),
+        "{ \"jsonrpc\": \"2.0\", \"method\": \"pay\", \"id\": %d, \"params\": { \"bolt11\": \"%s\" } }", tr_sessionGetLnNextMsgId(
+        msgs->torrent->session), bolt11);
+    tr_variant* top;
+    bool success = tr_sessionSendLnMessage(msgs->torrent->session, outbuf, &top);
+    if (success)
+    {
+        tr_variant* resdict;
+        tr_variantDictFindDict(top, TR_KEY_result, &resdict);
+        char const* status;
+        bool found_status = tr_variantDictFindStr(resdict, TR_KEY_status, &status, NULL);
+        if (found_status && !strcmp(status, "complete"))
+        {
+            dbgmsg(msgs, "Successfully paid invoice");
+            success = true;
+        }
+        else
+        {
+            dbgmsg(msgs, "Error paying invoice");
+            success = false;
+        }
+
+        tr_variantFree(top);
+    }
+
+    return success;
+}
+
+static bool lnCheckAndPayInvoice(tr_peerMsgs* msgs, char const* bolt11, tr_block_index_t* block_to_request, int* begin,
+    int* length)
+{
+    char outbuf[4096];
+    memset(outbuf, 0, sizeof(outbuf));
+    tr_snprintf(outbuf, sizeof(outbuf),
+        "{ \"jsonrpc\": \"2.0\", \"method\": \"decodepay\", \"id\": %d, \"params\": { \"bolt11\": \"%s\" } }", tr_sessionGetLnNextMsgId(
+        msgs->torrent->session), bolt11);
+    tr_variant* top;
+    bool succ = tr_sessionSendLnMessage(msgs->torrent->session, outbuf, &top);
+    if (succ)
+    {
+        tr_variant* resdict;
+        tr_variantDictFindDict(top, TR_KEY_result, &resdict);
+        succ = false;
+        int64_t msatoshi;
+        // TODO we could be smarter with the currency (testnet vs. mainnet)
+        char const* currency;
+        char const* payee;
+        char const* description;
+        bool found_currency = tr_variantDictFindStr(resdict, TR_KEY_currency, &currency, NULL);
+        bool found_payee = tr_variantDictFindStr(resdict, TR_KEY_payee, &payee, NULL);
+        bool found_msatoshi = tr_variantDictFindInt(resdict, TR_KEY_msatoshi, &msatoshi);
+        bool found_description = tr_variantDictFindStr(resdict, TR_KEY_description, &description, NULL);
+        if (found_currency && found_payee && found_msatoshi && found_description)
+        {
+            dbgmsg(msgs, "Decoded bolt11 invoice with lightning-rpc: %lld msats in %s to %s: %s", msatoshi, currency, payee,
+                description);
+            if (msatoshi > getSession(msgs)->willing_to_pay_price_per_piece_msat)
+            {
+                dbgmsg(msgs, "Price per piece too high");
+            }
+            else if (msgs->desiredRequestCount < 1)
+            {
+                dbgmsg(msgs, "Peer sent us an invoice but we don't want to pay");
+            }
+            else
+            {
+                int ret = sscanf(description, "%d %d %d", block_to_request, begin, length);
+                if (ret == 3)
+                {
+                    succ = lnPayInvoice(msgs, bolt11);
+                    msgs->paid_payment_balance += tr_torPieceCountBytes(msgs->torrent, 0);
+                }
+                else
+                {
+                    dbgmsg(msgs, "Unable to parse description");
+                }
+            }
+        }
+        else
+        {
+            dbgmsg(msgs, "Invalid lightning-rpc reply");
+            succ = false;
+        }
+
+        tr_variantFree(top);
+    }
+
+    return succ;
+}
+
+static void parseTrPaymentRequest(tr_peerMsgs* msgs, uint32_t msglen, struct evbuffer* inbuf)
+{
+    tr_variant dict;
+    uint8_t* tmp = tr_new(uint8_t, msglen);
+    bool found_bolt11 = false;
+    char const* bolt11;
+
+    tr_peerIoReadBytes(msgs->io, inbuf, tmp, msglen);
+
+    if (msgs->paid_payment_balance > 16 * tr_torPieceCountBytes(msgs->torrent, 0))
+    {
+        // already have paid many pieces for this peer without receiving a piece
+        // TODO this algorithm could be improved
+        return;
+    }
+
+    if (tr_variantFromBencFull(&dict, tmp, msglen, NULL, NULL) == 0)
+    {
+        found_bolt11 = tr_variantDictFindStr(&dict, TR_KEY_bolt11, &bolt11, NULL);
+    }
+
+    tr_free(tmp);
+
+    if (!found_bolt11)
+    {
+        dbgmsg(msgs, "got tr_payments msg without bolt11");
+        tr_variantFree(&dict);
+        return;
+    }
+
+    dbgmsg(msgs, "got tr_payments msg: bolt11 %s", bolt11);
+
+    tr_block_index_t block_to_request;
+    int begin = 0;
+    int length = 0;
+    bool valid = lnCheckAndPayInvoice(msgs, bolt11, &block_to_request, &begin, &length);
+    if (valid)
+    {
+        dbgmsg(msgs, "invoice valid, requesting block %d:%d-%d", block_to_request, begin, length);
+        struct peer_request req;
+        blockToReq(msgs->torrent, block_to_request, &req);
+        protocolSendRequest(msgs, &req);
+    }
+    else
+    {
+        dbgmsg(msgs, "invoice invalid");
+    }
+
+    tr_variantFree(&dict);
 }
 
 static void parseUtMetadata(tr_peerMsgs* msgs, uint32_t msglen, struct evbuffer* inbuf)
@@ -1269,6 +1637,12 @@ static void parseLtep(tr_peerMsgs* msgs, uint32_t msglen, struct evbuffer* inbuf
         msgs->peerSupportsMetadataXfer = true;
         parseUtMetadata(msgs, msglen, inbuf);
     }
+    else if (ltep_msgid == TR_PAYMENTS_ID)
+    {
+        dbgmsg(msgs, "got tr payment");
+        msgs->peerSupportsPayments = true;
+        parseTrPaymentRequest(msgs, msglen, inbuf);
+    }
     else
     {
         dbgmsg(msgs, "skipping unknown ltep message (%d)", (int)ltep_msgid);
@@ -1388,10 +1762,31 @@ static void peerMadeRequest(tr_peerMsgs* msgs, struct peer_request const* req)
         allow = true;
     }
 
+    bool needPayment = false;
+    if (tr_sessionLightningConfigured(getSession(msgs)) && getSession(msgs)->requesting_price_per_piece_msat > 0)
+    {
+        updatePeerPaymentBalance(msgs);
+        int bytes = req->length;
+        needPayment = msgs->received_payment_balance < bytes;
+        if (needPayment)
+        {
+            dbgmsg(msgs, "rejecting request ... need payment");
+            allow = false;
+        }
+        else
+        {
+            msgs->received_payment_balance -= bytes;
+        }
+    }
+
     if (allow)
     {
         msgs->peerAskedFor[msgs->peer.pendingReqsToClient++] = *req;
         prefetchPieces(msgs);
+    }
+    else if (needPayment)
+    {
+        protocolSendRequestPayment(msgs, req);
     }
     else if (fext)
     {
@@ -1498,7 +1893,21 @@ static int readBtPiece(tr_peerMsgs* msgs, struct evbuffer* inbuf, size_t inlen, 
         dbgmsg(msgs, "got %zu bytes for block %u:%u->%u ... %d remain", n, req->index, req->offset, req->length,
             (int)(req->length - evbuffer_get_length(block_buffer)));
 
-        if (evbuffer_get_length(block_buffer) < req->length)
+        // deducting the balance
+        // assuming here we're receiving the goods we paid for
+        // TODO: shouldn't do this until the piece has been hashed
+        if (msgs->paid_payment_balance > evbuffer_get_length(block_buffer))
+        {
+            msgs->paid_payment_balance -= evbuffer_get_length(block_buffer);
+        }
+        else
+        {
+            msgs->paid_payment_balance = 0;
+        }
+
+        dbgmsg(msgs, "I've paid for %lld bytes", msgs->paid_payment_balance);
+
+        if (evbuffer_get_length(block_buffer) < (int)req->length)
         {
             return READ_LATER;
         }

@@ -8,8 +8,11 @@
 
 #include <errno.h> /* ENOENT */
 #include <limits.h> /* INT_MAX */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h> /* memcpy */
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <signal.h>
 
@@ -1128,6 +1131,22 @@ static void sessionSetImpl(void* vdata)
     if (tr_variantDictFindBool(settings, TR_KEY_scrape_paused_torrents_enabled, &boolVal))
     {
         session->scrapePausedTorrents = boolVal;
+    }
+
+    if (tr_variantDictFindStr(settings, TR_KEY_lightning_rpc_name, &str, NULL))
+    {
+        dbgmsg("Lightning RPC name: %s", str);
+        tr_sessionSetLightningRPCName(session, str);
+    }
+
+    if (tr_variantDictFindInt(settings, TR_KEY_requesting_price_per_piece_msat, &i))
+    {
+        session->requesting_price_per_piece_msat = i;
+    }
+
+    if (tr_variantDictFindInt(settings, TR_KEY_willing_to_pay_price_per_piece_msat, &i))
+    {
+        session->willing_to_pay_price_per_piece_msat = i;
     }
 
     data->done = true;
@@ -2867,6 +2886,17 @@ void tr_sessionSetTorrentDoneScript(tr_session* session, char const* scriptFilen
     }
 }
 
+void tr_sessionSetLightningRPCName(tr_session* session, char const* lightning_rpc_name)
+{
+    TR_ASSERT(tr_isSession(session));
+
+    if (session->lightning_rpc_name != lightning_rpc_name)
+    {
+        tr_free(session->lightning_rpc_name);
+        session->lightning_rpc_name = tr_strdup(lightning_rpc_name);
+    }
+}
+
 /***
 ****
 ***/
@@ -3041,4 +3071,162 @@ int tr_sessionCountQueueFreeSlots(tr_session* session, tr_direction dir)
     }
 
     return max - active_count;
+}
+
+char* tr_sessionGetLightningRPCName(tr_session const* session)
+{
+    if (!tr_isSession(session))
+    {
+        return NULL;
+    }
+
+    return session->lightning_rpc_name;
+}
+
+bool tr_sessionLightningConfigured(tr_session const* session)
+{
+    if (!tr_isSession(session))
+    {
+        return false;
+    }
+
+    return session->lightning_rpc_name && session->lightning_rpc_name[0];
+}
+
+static int lnConnect(tr_session* session)
+{
+    if (session->lightning_connected)
+    {
+        return session->lightning_fd;
+    }
+
+    char* lightning_rpc = tr_sessionGetLightningRPCName(session);
+    if (!lightning_rpc || lightning_rpc[0] == '\0')
+    {
+        return -1;
+    }
+
+    dbgmsg("Connecting to lightning-rpc");
+    struct sockaddr_un addr;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    strcpy(addr.sun_path, lightning_rpc);
+    addr.sun_family = AF_UNIX;
+
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0)
+    {
+        dbgmsg("Could not connect to lightning-rpc");
+        return -1;
+    }
+
+    // we'll do blocking reads but with a 1s timeout
+    // TODO: Windows support
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 1000000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof tv);
+    session->lightning_connected = true;
+    session->lightning_fd = fd;
+    return fd;
+}
+
+static bool write_all(int fd, void* data, size_t size)
+{
+    while (size)
+    {
+        ssize_t done;
+
+        dbgmsg("Writing %u bytes to LN", size);
+        done = write(fd, data, size);
+        if (done < 0 && errno == EINTR)
+        {
+            continue;
+        }
+
+        if (done <= 0)
+        {
+            return false;
+        }
+
+        data = (char*)data + done;
+        size -= done;
+    }
+
+    return true;
+}
+
+bool tr_sessionSendLnMessage(tr_session* session, char* msg, tr_variant** result)
+{
+    int fd = lnConnect(session);
+    if (fd == -1)
+    {
+        dbgmsg("Could not connect to lightning-rpc");
+        return false;
+    }
+
+    dbgmsg("Writing to LN (%u bytes): %s", strlen(msg), msg);
+    if (!write_all(fd, msg, strlen(msg)))
+    {
+        dbgmsg("Could not write to lightning-rpc");
+        return false;
+    }
+
+    session->lightning_next_id++;
+
+    char rbuf[4096];
+    memset(rbuf, 0, sizeof(rbuf));
+    if (read(fd, rbuf, sizeof(rbuf)) < 0)
+    {
+        dbgmsg("Could not read lightning-rpc reply");
+        close(fd);
+        return false;
+    }
+
+    tr_variant* top = tr_new0(tr_variant, 1);
+    tr_variantInitDict(top, 0);
+    tr_variant* errdict;
+    tr_variant* resdict;
+    bool have_content = tr_variantFromJson(top, rbuf, strlen(rbuf)) == 0;
+    if (!have_content)
+    {
+        dbgmsg("Missing lightning-rpc reply");
+        close(fd);
+        return false;
+    }
+
+    bool found_error = tr_variantDictFindDict(top, TR_KEY_error, &errdict);
+    bool found_result = tr_variantDictFindDict(top, TR_KEY_result, &resdict);
+    if (!found_error && !found_result)
+    {
+        dbgmsg("Invalid lightning-rpc reply");
+        return false;
+    }
+
+    if (found_error)
+    {
+        char const* errstr;
+        if (tr_variantDictFindStr(errdict, TR_KEY_message, &errstr, NULL))
+        {
+            dbgmsg("Error in lightning-rpc reply: %s", errstr);
+        }
+
+        return false;
+    }
+
+    int64_t idnum = -1;
+    bool found_id = tr_variantDictFindInt(top, TR_KEY_id, &idnum);
+    if (!found_id || idnum != session->lightning_next_id - 1)
+    {
+        dbgmsg("No or wrong id in lightning-rpc reply");
+        return false;
+    }
+    else
+    {
+        *result = top;
+        return true;
+    }
+}
+
+int tr_sessionGetLnNextMsgId(tr_session* session)
+{
+    return session->lightning_next_id;
 }
